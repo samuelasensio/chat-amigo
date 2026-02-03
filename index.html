@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<title>Chatillo Amigo — Cloudflare Edition</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  body { margin:0; background:#0b0f1a; color:white; font-family:system-ui; display:flex; height:100vh }
+  #sidebar { width:260px; background:#111827; padding:20px; display:flex; flex-direction:column; gap:10px }
+  #rooms { flex:1; overflow-y:auto }
+  #chat { flex:1; display:flex; flex-direction:column }
+  #messages { flex:1; overflow-y:auto; padding:20px }
+  .msg { margin-bottom:12px }
+  .me { background:#4f46e5; padding:10px 14px; border-radius:12px; display:inline-block }
+  .other { background:#1f2937; padding:10px 14px; border-radius:12px; display:inline-block }
+  #sendBox { display:flex; padding:10px; gap:10px }
+  input, button { border:none; outline:none; border-radius:8px; padding:10px; font-size:14px }
+  button { background:#4f46e5; color:white; cursor:pointer }
+  #login { position:fixed; inset:0; background:#0b0f1a; display:flex; align-items:center; justify-content:center }
+  #login form { background:#111827; padding:30px; border-radius:12px; width:300px; display:flex; flex-direction:column; gap:10px }
+</style>
+</head>
+<body>
+
+<!-- LOGIN -->
+<div id="login">
+  <form id="loginForm">
+    <h2 style="text-align:center">Chatillo Amigo</h2>
+    <input id="email" type="email" placeholder="Email">
+    <input id="password" type="password" placeholder="Contraseña">
+    <button>Entrar</button>
+  </form>
+</div>
+
+<!-- SIDEBAR -->
+<div id="sidebar">
+  <h3>Salas</h3>
+  <div id="rooms"></div>
+
+  <h4>Crear sala</h4>
+  <input id="roomName" placeholder="Nombre de sala">
+  <button id="createRoom">Crear</button>
+</div>
+
+<!-- CHAT -->
+<div id="chat">
+  <div id="messages"></div>
+  <div id="sendBox">
+    <input id="msg" placeholder="Escribe un mensaje...">
+    <button id="send">Enviar</button>
+  </div>
+</div>
+
+<!-- ============================= -->
+<!--  FRONTEND JS (CLIENTE)       -->
+<!-- ============================= -->
+<script>
+const API = ""; // mismo dominio del Worker
+let token = null;
+let user = null;
+let currentRoom = null;
+let poll = null;
+
+async function api(path, method="GET", body=null) {
+  const res = await fetch(API+path, {
+    method,
+    headers: {
+      "Content-Type":"application/json",
+      ...(token ? { "Authorization":"Bearer "+token } : {})
+    },
+    body: body ? JSON.stringify(body) : null
+  });
+  return res.json();
+}
+
+document.getElementById("loginForm").onsubmit = async e => {
+  e.preventDefault();
+  const email = email.value;
+  const password = password.value;
+
+  const r = await api("/api/login","POST",{email,password});
+  if(r.error){ alert("Credenciales incorrectas"); return }
+
+  token = r.token;
+  user = r.user;
+  login.style.display="none";
+  loadRooms();
+};
+
+async function loadRooms(){
+  const r = await api("/api/rooms");
+  rooms.innerHTML="";
+  r.rooms.forEach(room=>{
+    const b=document.createElement("button");
+    b.textContent=room.name;
+    b.style.width="100%";
+    b.style.textAlign="left";
+    b.style.padding="8px";
+    b.style.background="#1f2937";
+    b.onclick=()=>joinRoom(room.id);
+    rooms.appendChild(b);
+  });
+}
+
+async function joinRoom(id){
+  currentRoom=id;
+  messages.innerHTML="";
+  if(poll) clearInterval(poll);
+  await loadMessages();
+  poll=setInterval(loadMessages,1500);
+}
+
+async function loadMessages(){
+  if(!currentRoom) return;
+  const r = await api(`/api/rooms/${currentRoom}/messages`);
+  messages.innerHTML="";
+  r.messages.forEach(m=>{
+    const div=document.createElement("div");
+    div.className="msg";
+    const bubble=document.createElement("div");
+    bubble.className = (m.email===user.email) ? "me" : "other";
+    bubble.textContent=m.text;
+    div.appendChild(bubble);
+    messages.appendChild(div);
+  });
+  messages.scrollTop=messages.scrollHeight;
+}
+
+send.onclick = async ()=>{
+  if(!msg.value.trim()) return;
+  await api(`/api/rooms/${currentRoom}/messages`,"POST",{text:msg.value});
+  msg.value="";
+  loadMessages();
+};
+
+createRoom.onclick = async ()=>{
+  const name = roomName.value.trim();
+  if(!name) return;
+  await api("/api/rooms","POST",{name});
+  roomName.value="";
+  loadRooms();
+};
+</script>
+
+<!-- ============================= -->
+<!--  BACKEND (WORKER)            -->
+<!-- ============================= -->
+<!--  COPIA ESTE SCRIPT EN TU     -->
+<!--  CLOUDFLARE WORKER REAL      -->
+<!-- ============================= -->
+<script id="worker">
+/*
+  Pega este contenido en tu Worker de Cloudflare.
+  En wrangler.toml añade:
+
+  [[d1_databases]]
+  binding = "DB"
+  database_name = "chatillo"
+  database_id = "xxxx"
+
+  [vars]
+  MASTER_KEY = "clave-super-secreta"
+*/
+
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    const path = url.pathname;
+    const method = request.method;
+
+    async function body(){ try{return await request.json()}catch{return{}} }
+    function json(d,s=200){ return new Response(JSON.stringify(d),{status:s,headers:{"Content-Type":"application/json"}}) }
+
+    async function auth(){
+      const h=request.headers.get("Authorization");
+      if(!h) return null;
+      const id=parseInt(h.replace("Bearer ",""));
+      return await env.DB.prepare("SELECT id,email,name FROM users WHERE id=?").bind(id).first();
+    }
+
+    // LOGIN
+    if(path==="/api/login" && method==="POST"){
+      const b=await body();
+      const u=await env.DB.prepare("SELECT * FROM users WHERE email=?").bind(b.email).first();
+      if(!u || u.password!==b.password) return json({error:"bad"},401);
+      return json({token:String(u.id), user:{id:u.id,email:u.email,name:u.name}});
+    }
+
+    // LIST ROOMS
+    if(path==="/api/rooms" && method==="GET"){
+      const u=await auth(); if(!u) return json({error:"auth"},401);
+      const r=await env.DB.prepare("SELECT * FROM rooms").all();
+      return json({rooms:r.results});
+    }
+
+    // CREATE ROOM
+    if(path==="/api/rooms" && method==="POST"){
+      const u=await auth(); if(!u) return json({error:"auth"},401);
+      const b=await body();
+      await env.DB.prepare("INSERT INTO rooms (name) VALUES (?)").bind(b.name).run();
+      return json({ok:true});
+    }
+
+    // MESSAGES
+    const m=path.match(/^\/api\/rooms\/(\d+)\/messages$/);
+    if(m){
+      const roomId=parseInt(m[1]);
+      const u=await auth(); if(!u) return json({error:"auth"},401);
+
+      if(method==="GET"){
+        const msgs=await env.DB.prepare(
+          "SELECT messages.*, users.email FROM messages JOIN users ON users.id=messages.user_id WHERE room_id=? ORDER BY id ASC"
+        ).bind(roomId).all();
+        return json({messages:msgs.results});
+      }
+
+      if(method==="POST"){
+        const b=await body();
+        await env.DB.prepare(
+          "INSERT INTO messages (room_id,user_id,text) VALUES (?,?,?)"
+        ).bind(roomId,u.id,b.text).run();
+        return json({ok:true});
+      }
+    }
+
+    return new Response("Not found", {status:404});
+  }
+}
+</script>
+
+<!-- ============================= -->
+<!--  ESQUEMA D1 (PÉGALO EN D1)   -->
+<!-- ============================= -->
+<script id="schema">
+/*
+CREATE TABLE users (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  email TEXT UNIQUE,
+  name TEXT,
+  password TEXT
+);
+
+CREATE TABLE rooms (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT
+);
+
+CREATE TABLE messages (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  room_id INTEGER,
+  user_id INTEGER,
+  text TEXT
+);
+*/
+</script>
+
+</body>
+</html>
